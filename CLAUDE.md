@@ -19,12 +19,19 @@ axis, distinct from Folia's *experimental* (a correctness-confidence axis — se
 below). **NeoForge ships on the 1.21.1 line (since v0.11.0 — the community
 Voxy port is the client pairing) and on the 26.1/26.2 lines (since v0.13.1,
 user decision 2026-08-27 — the VoX/Foxy fork is the client pairing there); the
-1.21.11/1.21.10 lines still do not ship it (no Voxy route).** Gated by `LINE_SHIP_NEOFORGE` in `.github/line.env`, from
+1.21.11/1.21.10 lines still do not ship it (`LINE_SHIP_NEOFORGE=false`).** Gated by `LINE_SHIP_NEOFORGE` in `.github/line.env`, from
 which release.yml, release_check.py, and the contract tests all DERIVE (R2-5) —
 one line.env edit is the whole flip; build.yml still builds + tests the NeoForge
 module on EVERY line so the port stays maintained. **Wire compatibility is NEVER
 tiered** — every jar speaks the same protocol at full fidelity, and every
 never-tiered claim names a test that reds when violated (plan §1.2).
+
+**Current operational reference (2026-09-08):** use the
+[current loader/artifact matrix](docs/planning/per-version-surfaces.md#current-loader-and-artifact-surfaces-2026-09-08)
+and [live-profile inventory](docs/testing/astra-live-profiles.md) for shipping flags,
+consumer pairings and validation limits. The v0.11.0/port decisions above remain
+historical records. NeoForge currently nests both sqlite-jdbc and zstd-jni as stock
+jarJar libraries on every maintained line.
 
 ## Project Structure
 
