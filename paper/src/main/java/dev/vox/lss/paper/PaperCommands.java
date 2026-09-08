@@ -119,7 +119,7 @@ public class PaperCommands implements CommandExecutor, TabCompleter {
             }
             sender.sendMessage(key.name() + " = "
                     + dev.vox.lss.common.config.RuntimeSettings.renderReplyValue(key, result, rawValue)
-                    + " — " + key.applyNote() + repushNote);
+                    + " — " + key.applyNote() + repushNote + result.persistenceNote());
         });
     }
 

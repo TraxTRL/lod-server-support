@@ -120,7 +120,7 @@ public class LSSServerCommands {
         }
         String reply = keyName + " = "
                 + dev.vox.lss.common.config.RuntimeSettings.renderReplyValue(key, result, rawValue)
-                + " — " + key.applyNote() + repushNote;
+                + " — " + key.applyNote() + repushNote + result.persistenceNote();
         source.sendSuccess(() -> Component.literal(reply), true);
         return 1;
     }

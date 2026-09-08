@@ -230,7 +230,11 @@ public final class RuntimeSettings {
      *  mutation (scalar OR a per-world put/remove) sets it, and the command surfaces
      *  re-push on THIS, never on a reply-string comparison (which a per-world set, whose
      *  scalar is unchanged, would silently fail). */
-    public record ApplyResult(String display, boolean repush) {}
+    public record ApplyResult(String display, boolean repush, boolean persisted) {
+        public String persistenceNote() {
+            return persisted ? "" : "; applied, but not saved — see server log";
+        }
+    }
 
     /**
      * The full apply sequence minus the platform-specific reply/re-push: parse+clamp+
@@ -239,18 +243,24 @@ public final class RuntimeSettings {
      * IllegalArgumentException on a malformed value (nothing assigned).
      */
     public static ApplyResult applyAndPersist(ServerConfigBase config, SettingKey key, String rawValue) {
+        return applyWithPersistenceOutcome(config, key, rawValue);
+    }
+
+    /** Runtime application and per-world repush survive a persistence failure. */
+    public static ApplyResult applyWithPersistenceOutcome(ServerConfigBase config,
+                                                          SettingKey key, String rawValue) {
         boolean isLod = key.name().equals("lodDistanceChunks");
         int beforeScalar = isLod ? config.lodDistanceChunks : 0;
         Map<String, Integer> beforeMap = isLod ? snapshotByWorld(config) : null;
         key.apply().apply(config, rawValue);
         config.validate();
-        config.save();
+        boolean persisted = config.trySave();
         if (isLod) {
             boolean repush = beforeScalar != config.lodDistanceChunks
                     || !beforeMap.equals(snapshotByWorld(config));
-            return new ApplyResult(lodDistanceDisplay(config, rawValue), repush);
+            return new ApplyResult(lodDistanceDisplay(config, rawValue), repush, persisted);
         }
-        return new ApplyResult(key.current().apply(config), false);
+        return new ApplyResult(key.current().apply(config), false, persisted);
     }
 
     /** The reply's value text: lodDistanceChunks bakes its own per-world-aware clamp note
