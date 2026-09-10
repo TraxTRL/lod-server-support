@@ -75,5 +75,5 @@ public final class ClientStatusScreen extends Screen {
         return super.keyReleased(event);
     }
     @Override public boolean isPauseScreen() { return false; }
-    @Override public void onClose() { minecraft.setScreenAndShow(parent); }
+    @Override public void onClose() { onReturn.run(); minecraft.setScreenAndShow(parent); }
 }
