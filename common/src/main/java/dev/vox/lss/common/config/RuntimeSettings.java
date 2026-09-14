@@ -340,6 +340,16 @@ public final class RuntimeSettings {
         return config.trySave();
     }
 
+    /** Owner-only changed-key undo using the same scratch validation and publication as apply. */
+    public static boolean undoBatch(ServerConfigBase config, SettingsPatch.Preview applied) {
+        var current = new java.util.LinkedHashMap<String, String>();
+        applied.relevantInputs().keySet().forEach(name -> current.put(name, batchValue(config, name)));
+        var candidate = SettingsPatch.undo(applied, config, current, values -> validateCandidate(config, values));
+        for (var key : KEYS) if (applied.changes().containsKey(key.name())) key.apply().apply(config, candidate.get(key.name()));
+        config.validate();
+        return config.trySave();
+    }
+
     /** Runtime application and per-world repush survive a persistence failure. */
     public static ApplyResult applyWithPersistenceOutcome(ServerConfigBase config,
                                                           SettingKey key, String rawValue) {
