@@ -54,6 +54,7 @@ public class ChunkGenerationService {
         LoadedColumnData serialize(ServerLevel level, LevelChunk chunk, int cx, int cz);
     }
 
+    private final Object lock = new Object();
     private final LinkedHashMap<PendingGenerationKey, PendingGeneration> active = new LinkedHashMap<>();
     private final Map<UUID, Integer> perPlayerActiveCount = new HashMap<>();
     // Departing-player ticket releases, staggered a few per tick — a one-call bulk sweep
@@ -91,15 +92,19 @@ public class ChunkGenerationService {
 
     /** Wired by RequestProcessingService after construction (it owns the filter). */
     public void setDirtyContentFilter(DirtyContentFilter filter) {
-        this.dirtyContentFilter = filter;
+        synchronized (this.lock) {
+            this.dirtyContentFilter = filter;
+        }
     }
 
     /** Runtime cap change (v0.11.0 stage C — the tick-poll pattern): called from the
      *  owning tick thread before admission. Lowering never cancels in-flight
      *  generations — it only gates NEW admissions. */
     public void updateCaps(int global, int perPlayer) {
-        this.maxConcurrent = global;
-        this.maxPerPlayerActive = perPlayer;
+        synchronized (this.lock) {
+            this.maxConcurrent = global;
+            this.maxPerPlayerActive = perPlayer;
+        }
     }
 
     /**
@@ -109,35 +114,37 @@ public class ChunkGenerationService {
     public boolean submitGeneration(UUID playerUuid, ServerLevel level, int cx, int cz, long submissionOrder) {
         var key = new PendingGenerationKey(level.dimension(), cx, cz);
 
-        // Already active — piggyback on existing entry
-        var existing = this.active.get(key);
-        if (existing != null) {
-            existing.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
-            incrementCount(this.perPlayerActiveCount, playerUuid);
-            return true;
-        }
-
-        // Try to add directly to active
-        int playerActive = this.perPlayerActiveCount.getOrDefault(playerUuid, 0);
-        if (this.active.size() < this.maxConcurrent && playerActive < this.maxPerPlayerActive) {
-            var pos = new ChunkPos(cx, cz);
-            // A pending deferred release for this key means the ticket is STILL HELD —
-            // cancel the release and reuse it instead of add+remove churn through the
-            // distance graph (the completion path's removal keeps the books 1:1).
-            if (!this.deferredReleases.cancel(key)) {
-                level.getChunkSource().addTicketWithRadius(LSS_GEN_TICKET, pos, 0);
+        synchronized (this.lock) {
+            // Already active — piggyback on existing entry
+            var existing = this.active.get(key);
+            if (existing != null) {
+                existing.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
+                incrementCount(this.perPlayerActiveCount, playerUuid);
+                return true;
             }
 
-            var gen = new PendingGeneration(pos, level);
-            gen.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
-            this.active.put(key, gen);
-            incrementCount(this.perPlayerActiveCount, playerUuid);
-            this.totalSubmitted++;
-            return true;
-        }
+            // Try to add directly to active
+            int playerActive = this.perPlayerActiveCount.getOrDefault(playerUuid, 0);
+            if (this.active.size() < this.maxConcurrent && playerActive < this.maxPerPlayerActive) {
+                var pos = new ChunkPos(cx, cz);
+                // A pending deferred release for this key means the ticket is STILL HELD —
+                // cancel the release and reuse it instead of add+remove churn through the
+                // distance graph (the completion path's removal keeps the books 1:1).
+                if (!this.deferredReleases.cancel(key)) {
+                    level.getChunkSource().addTicketWithRadius(LSS_GEN_TICKET, pos, 0);
+                }
 
-        // At capacity — reject. Client's retry loop will re-request later.
-        return false;
+                var gen = new PendingGeneration(pos, level);
+                gen.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
+                this.active.put(key, gen);
+                incrementCount(this.perPlayerActiveCount, playerUuid);
+                this.totalSubmitted++;
+                return true;
+            }
+
+            // At capacity — reject. Client's retry loop will re-request later.
+            return false;
+        }
     }
 
     /**
@@ -146,85 +153,90 @@ public class ChunkGenerationService {
      * column data; timeouts and extraction errors carry {@code columnData == null}.
      */
     public List<TickSnapshot.GenerationReadyData> tick() {
-        // Drain a few departing-player ticket releases even when nothing is active —
-        // deferral must never strand a force-load ticket.
-        this.deferredReleases.drain(DeferredTicketReleases.MAX_RELEASES_PER_TICK);
-        if (this.active.isEmpty()) return List.of();
-        List<TickSnapshot.GenerationReadyData> ready = null;
-        var iter = this.active.entrySet().iterator();
-        while (iter.hasNext()) {
-            var entry = iter.next();
-            var gen = entry.getValue();
-            gen.ticksWaiting++;
+        synchronized (this.lock) {
+            // Drain a few departing-player ticket releases even when nothing is active —
+            // deferral must never strand a force-load ticket.
+            this.deferredReleases.drain(DeferredTicketReleases.MAX_RELEASES_PER_TICK);
+            if (this.active.isEmpty()) return List.of();
+            List<TickSnapshot.GenerationReadyData> ready = null;
+            List<PendingGenerationKey> toRemove = new ArrayList<>();
+            for (var entry : this.active.entrySet()) {
+                var gen = entry.getValue();
+                gen.ticksWaiting++;
 
-            if (gen.ticksWaiting > this.timeoutTicks) {
-                LSSLogger.debug("Generation timeout for chunk " + gen.pos.x() + "," + gen.pos.z()
-                        + " after " + gen.ticksWaiting + " ticks (" + gen.callbacks.size() + " callbacks)");
-                if (ready == null) ready = new ArrayList<>();
-                // Timeout is TRANSIENT: the outcome drops silently server-side and the client's
-                // re-declaration retries — never NOT_GENERATED, which is session-permanent.
-                addFailures(ready, gen, true);
-                // Ticket release is DEFERRED, mirroring removePlayer: a stall that outlasts
-                // the timeout replays the bunched admission histogram as bunched timeouts —
-                // many corridor-scattered tickets crossing timeoutTicks within a few ticks —
-                // and releasing them inline is the mass-removal shape DeferredTicketReleases
-                // exists to stagger (C2ME's consolidateSchedules froze 60 s on it). A
-                // re-declared miss that re-admits before the drain cancels the release and
-                // reuses the still-held ticket. (The completion path's release stays inline:
-                // one ticket per completed chunk, event-paced.)
-                var level = gen.level;
-                var pos = gen.pos;
-                this.deferredReleases.defer(entry.getKey(),
-                        () -> level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, pos, 0));
-                iter.remove();
-                this.totalTimeouts++;
-                continue;
-            }
+                if (gen.ticksWaiting > this.timeoutTicks) {
+                    LSSLogger.debug("Generation timeout for chunk " + gen.pos.x() + "," + gen.pos.z()
+                            + " after " + gen.ticksWaiting + " ticks (" + gen.callbacks.size() + " callbacks)");
+                    if (ready == null) ready = new ArrayList<>();
+                    // Timeout is TRANSIENT: the outcome drops silently server-side and the client's
+                    // re-declaration retries — never NOT_GENERATED, which is session-permanent.
+                    addFailures(ready, gen, true);
+                    // Ticket release is DEFERRED, mirroring removePlayer: a stall that outlasts
+                    // the timeout replays the bunched admission histogram as bunched timeouts —
+                    // many corridor-scattered tickets crossing timeoutTicks within a few ticks —
+                    // and releasing them inline is the mass-removal shape DeferredTicketReleases
+                    // exists to stagger (C2ME's consolidateSchedules froze 60 s on it). A
+                    // re-declared miss that re-admits before the drain cancels the release and
+                    // reuses the still-held ticket. (The completion path's release stays inline:
+                    // one ticket per completed chunk, event-paced.)
+                    var level = gen.level;
+                    var pos = gen.pos;
+                    this.deferredReleases.defer(entry.getKey(),
+                            () -> level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, pos, 0));
+                    toRemove.add(entry.getKey());
+                    this.totalTimeouts++;
+                    continue;
+                }
 
-            LevelChunk chunk = gen.level.getChunkSource().getChunkNow(gen.pos.x(), gen.pos.z());
-            if (chunk != null) {
-                if (ready == null) ready = new ArrayList<>();
-                try {
-                    long columnTimestamp = LSSConstants.epochSeconds();
-                    LoadedColumnData columnData = this.columnSerializer.serialize(
-                            gen.level, chunk, gen.pos.x(), gen.pos.z());
-                    String dimension = gen.level.dimension().identifier().toString();
+                LevelChunk chunk = gen.level.getChunkSource().getChunkNow(gen.pos.x(), gen.pos.z());
+                if (chunk != null) {
+                    if (ready == null) ready = new ArrayList<>();
+                    try {
+                        long columnTimestamp = LSSConstants.epochSeconds();
+                        LoadedColumnData columnData = this.columnSerializer.serialize(
+                                gen.level, chunk, gen.pos.x(), gen.pos.z());
+                        String dimension = gen.level.dimension().identifier().toString();
 
-                    // Seed the dirty filter with the served bytes: the chunk's imminent
-                    // unload-save would otherwise count as "first observed save" and
-                    // trigger a pointless second send of the identical column.
-                    if (this.dirtyContentFilter != null) {
-                        this.dirtyContentFilter.seed(dimension, gen.pos.x(), gen.pos.z(),
-                                columnData.serializedSections());
+                        // Seed the dirty filter with the served bytes: the chunk's imminent
+                        // unload-save would otherwise count as "first observed save" and
+                        // trigger a pointless second send of the identical column.
+                        if (this.dirtyContentFilter != null) {
+                            this.dirtyContentFilter.seed(dimension, gen.pos.x(), gen.pos.z(),
+                                    columnData.serializedSections());
+                        }
+
+                        // One GenerationReadyData per callback — processing thread will voxelize
+                        for (var cb : gen.callbacks) {
+                            ready.add(new TickSnapshot.GenerationReadyData(
+                                    cb.playerUuid, gen.pos.x(), gen.pos.z(), dimension,
+                                    columnData, columnTimestamp, cb.submissionOrder));
+                            decrementCount(this.perPlayerActiveCount, cb.playerUuid);
+                        }
+                        this.totalCompleted++;
+                    } catch (Throwable t) {
+                        LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), t);
+                        // Extraction failure is PERMANENT (a corrupt chunk must not be hammered):
+                        // the client gets NOT_GENERATED and only a dirty broadcast revives it.
+                        addFailures(ready, gen, false);
+                        // Failed extraction is a terminal removal that is neither completed nor a
+                        // timeout — count it as removed-in-flight so the generation books
+                        // (submitted == completed + timeouts + removed) still balance (soak law A4).
+                        this.totalRemovedInFlight++;
+                    } finally {
+                        // Always release the force-load ticket and drop the active entry — even on an
+                        // Error during serialization — or the chunk stays force-loaded forever and the
+                        // entry is retried (and re-throws) every server tick.
+                        gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
+                        toRemove.add(entry.getKey());
                     }
-
-                    // One GenerationReadyData per callback — processing thread will voxelize
-                    for (var cb : gen.callbacks) {
-                        ready.add(new TickSnapshot.GenerationReadyData(
-                                cb.playerUuid, gen.pos.x(), gen.pos.z(), dimension,
-                                columnData, columnTimestamp, cb.submissionOrder));
-                        decrementCount(this.perPlayerActiveCount, cb.playerUuid);
-                    }
-                    this.totalCompleted++;
-                } catch (Throwable t) {
-                    LSSLogger.error("Failed to extract primitives for generated chunk at " + gen.pos.x() + ", " + gen.pos.z(), t);
-                    // Extraction failure is PERMANENT (a corrupt chunk must not be hammered):
-                    // the client gets NOT_GENERATED and only a dirty broadcast revives it.
-                    addFailures(ready, gen, false);
-                    // Failed extraction is a terminal removal that is neither completed nor a
-                    // timeout — count it as removed-in-flight so the generation books
-                    // (submitted == completed + timeouts + removed) still balance (soak law A4).
-                    this.totalRemovedInFlight++;
-                } finally {
-                    // Always release the force-load ticket and drop the active entry — even on an
-                    // Error during serialization — or the chunk stays force-loaded forever and the
-                    // entry is retried (and re-throws) every server tick.
-                    gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
-                    iter.remove();
                 }
             }
+
+            for (var key : toRemove) {
+                this.active.remove(key);
+            }
+            return ready != null ? ready : List.of();
         }
-        return ready != null ? ready : List.of();
     }
 
     /** Add a failure outcome (columnData == null) for every callback of the entry.
@@ -243,48 +255,61 @@ public class ChunkGenerationService {
     }
 
     public void removePlayer(UUID playerUuid) {
-        this.perPlayerActiveCount.remove(playerUuid);
+        synchronized (this.lock) {
+            this.perPlayerActiveCount.remove(playerUuid);
 
-        // Clean up active entries. Ticket releases are DEFERRED, not executed here: this
-        // sweep can hold the per-player cap's worth of corridor-scattered tickets, and
-        // releasing them in one call is the disconnect freeze (see DeferredTicketReleases).
-        var iter = this.active.entrySet().iterator();
-        while (iter.hasNext()) {
-            var entry = iter.next();
-            var gen = entry.getValue();
-            gen.callbacks.removeIf(cb -> cb.playerUuid.equals(playerUuid));
-            if (gen.callbacks.isEmpty()) {
-                var level = gen.level;
-                var pos = gen.pos;
-                this.deferredReleases.defer(entry.getKey(),
-                        () -> level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, pos, 0));
-                iter.remove();
-                // Submitted but neither completed nor timed out — without this counter the
-                // submitted/completed books can never re-balance after a kick or dimension change
-                this.totalRemovedInFlight++;
+            // Clean up active entries. Ticket releases are DEFERRED, not executed here: this
+            // sweep can hold the per-player cap's worth of corridor-scattered tickets, and
+            // releasing them in one call is the disconnect freeze (see DeferredTicketReleases).
+            List<PendingGenerationKey> toRemove = new ArrayList<>();
+            for (var entry : this.active.entrySet()) {
+                var gen = entry.getValue();
+                gen.callbacks.removeIf(cb -> cb.playerUuid.equals(playerUuid));
+                if (gen.callbacks.isEmpty()) {
+                    var level = gen.level;
+                    var pos = gen.pos;
+                    this.deferredReleases.defer(entry.getKey(),
+                            () -> level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, pos, 0));
+                    toRemove.add(entry.getKey());
+                    // Submitted but neither completed nor timed out — without this counter the
+                    // submitted/completed books can never re-balance after a kick or dimension change
+                    this.totalRemovedInFlight++;
+                }
+            }
+
+            for (var key : toRemove) {
+                this.active.remove(key);
             }
         }
     }
 
     public void shutdown() {
-        this.deferredReleases.flush(); // correctness over smoothness — never strand a ticket
-        for (var gen : this.active.values()) {
-            gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
+        synchronized (this.lock) {
+            this.deferredReleases.flush(); // correctness over smoothness — never strand a ticket
+            for (var gen : this.active.values()) {
+                gen.level.getChunkSource().removeTicketWithRadius(LSS_GEN_TICKET, gen.pos, 0);
+            }
+            this.active.clear();
+            this.perPlayerActiveCount.clear();
         }
-        this.active.clear();
-        this.perPlayerActiveCount.clear();
     }
 
     public String getDiagnostics() {
-        return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d, removed=%d",
-                totalSubmitted, totalCompleted, active.size(), totalTimeouts, totalRemovedInFlight);
+        synchronized (this.lock) {
+            return String.format("submitted=%d, completed=%d, active=%d, timeouts=%d, removed=%d",
+                    totalSubmitted, totalCompleted, active.size(), totalTimeouts, totalRemovedInFlight);
+        }
     }
 
     public long getTotalSubmitted() { return totalSubmitted; }
     public long getTotalCompleted() { return totalCompleted; }
     public long getTotalTimeouts() { return totalTimeouts; }
     public long getTotalRemovedInFlight() { return totalRemovedInFlight; }
-    public int getActiveCount() { return active.size(); }
+    public int getActiveCount() {
+        synchronized (this.lock) {
+            return active.size();
+        }
+    }
 
     private static void incrementCount(Map<UUID, Integer> map, UUID uuid) {
         map.merge(uuid, 1, Integer::sum);
