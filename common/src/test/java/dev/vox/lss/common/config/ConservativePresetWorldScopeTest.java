@@ -7,7 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 
-/** MC26.2 existing per-world distance flavor; this API is absent on the support lines. */
+/** Global presets preserve independent per-world distance overrides on every support line. */
 class ConservativePresetWorldScopeTest {
     @TempDir Path directory;
     private ConservativePresetTest.Config configured() {
