@@ -37,7 +37,22 @@ public final class RuntimeSettings {
     public record SettingKey(String name,
                              Function<ServerConfigBase, String> current,
                              BiFunction<ServerConfigBase, String, Void> apply,
-                             String applyNote) {}
+                             String applyNote) {
+        public SettingDescriptor descriptor() {
+            var stored = ServerSerializedSettings.descriptors().stream()
+                    .filter(descriptor -> descriptor.key().equals(name)).findFirst().orElseThrow();
+            String parser = stored.type() == SettingDescriptor.Type.BOOLEAN ? "; command: strict true | false"
+                    : stored.type() == SettingDescriptor.Type.DECIMAL ? "; command: finite decimal required"
+                    : name.equals("farPlayers") ? "; command: off | opt-in | optin | opt_in | on; invalid rejected"
+                    : "; command: integer required";
+            return new SettingDescriptor(name, stored.type(), stored.units(), "server." + name,
+                    stored.defaultPolicy(), stored.domain() + parser,
+                    "RuntimeSettings.byName(\"" + name + "\").apply; ServerConfigBase.validate",
+                    name.equals("lodDistanceChunks") ? java.util.Set.of(SettingDescriptor.Scope.SERVER, SettingDescriptor.Scope.WORLD_DISTANCE) : java.util.Set.of(SettingDescriptor.Scope.SERVER), name.equals("lodDistanceChunks") ? "Paper: world name, dimension, global; Fabric/Neo: dimension, global" : "global only",
+                    "all server platforms", applyNote, false, "applyWithPersistenceOutcome + platform reconcile",
+                    SettingDescriptor.Exposure.RUNTIME);
+        }
+    }
 
     private static int parseInt(String raw) {
         try {
@@ -205,6 +220,21 @@ public final class RuntimeSettings {
         return v;
     }
 
+    public static List<SettingBinding<ServerConfigBase>> serializedBindings() {
+        return ServerSerializedSettings.bindings().stream().map(binding -> {
+            var key = byName(binding.descriptor().key());
+            return key == null ? binding : new SettingBinding<ServerConfigBase>(key.descriptor(), binding.storedValue());
+        }).toList();
+    }
+
+    /** Includes advanced and legacy fields without making them runtime-settable. */
+    public static List<SettingDescriptor> descriptors() {
+        return ServerSerializedSettings.descriptors().stream().map(descriptor -> {
+            var key = byName(descriptor.key());
+            return key == null ? descriptor : key.descriptor();
+        }).toList();
+    }
+
     public static List<SettingKey> keys() {
         return KEYS;
     }
@@ -230,7 +260,11 @@ public final class RuntimeSettings {
      *  mutation (scalar OR a per-world put/remove) sets it, and the command surfaces
      *  re-push on THIS, never on a reply-string comparison (which a per-world set, whose
      *  scalar is unchanged, would silently fail). */
-    public record ApplyResult(String display, boolean repush) {}
+    public record ApplyResult(String display, boolean repush, boolean persisted) {
+        public String persistenceNote() {
+            return persisted ? "" : "; applied, but not saved — see server log";
+        }
+    }
 
     /**
      * The full apply sequence minus the platform-specific reply/re-push: parse+clamp+
@@ -239,18 +273,98 @@ public final class RuntimeSettings {
      * IllegalArgumentException on a malformed value (nothing assigned).
      */
     public static ApplyResult applyAndPersist(ServerConfigBase config, SettingKey key, String rawValue) {
+        return applyWithPersistenceOutcome(config, key, rawValue);
+    }
+
+    /** Prepare a validated patch without touching ingress-visible config or persistence.
+     * The registry order puts the configured global cap before its dependent per-player
+     * cap, independent of input map order. All parsing/clamping happens on scratch. */
+    public static SettingsPatch.Preview previewBatch(ServerConfigBase config,
+            java.util.Map<String, String> requested, java.util.Set<String> allowedKeys) {
+        var normalized = new java.util.LinkedHashMap<String, String>();
+        var allowed = new java.util.LinkedHashSet<String>();
+        for (String name : allowedKeys) {
+            var key = byName(name);
+            if (key == null) throw new IllegalArgumentException("not runtime-settable: " + name);
+            allowed.add(key.name());
+        }
+        for (var entry : requested.entrySet()) {
+            var key = byName(entry.getKey());
+            if (key == null || !allowed.contains(key.name())) throw new IllegalArgumentException("protected or out-of-scope key");
+            // This API selects SERVER GLOBAL. Existing explicit world commands retain their own map-aware path.
+            if (key.name().equals("lodDistanceChunks")) parseInt(entry.getValue());
+            if (normalized.putIfAbsent(key.name(), entry.getValue()) != null)
+                throw new IllegalArgumentException("duplicate setting after case normalization");
+        }
+        requested = java.util.Map.copyOf(normalized);
+        allowedKeys = java.util.Set.copyOf(allowed);
+        var relevant = new java.util.LinkedHashSet<>(requested.keySet());
+        if (relevant.contains("generationConcurrencyLimitGlobal") || relevant.contains("generationConcurrencyLimitPerPlayer")) {
+            relevant.add("generationConcurrencyLimitGlobal");
+            relevant.add("generationConcurrencyLimitPerPlayer");
+        }
+        if (relevant.contains("farPlayersMaxDistanceBlocks")) relevant.add("farPlayersMinDistanceBlocks");
+        var current = new java.util.LinkedHashMap<String, String>();
+        for (String name : relevant) {
+            current.put(name, batchValue(config, name));
+        }
+        return SettingsPatch.preview(config, current, requested, allowedKeys,
+                candidate -> validateCandidate(config, candidate));
+    }
+
+    private static String batchValue(ServerConfigBase config, String name) {
+        // Read-only validator dependency: not an additional runtime-settable key.
+        if (name.equals("farPlayersMinDistanceBlocks")) return Integer.toString(config.farPlayersMinDistanceBlocks);
+        return byName(name).current().apply(config);
+    }
+
+    private static java.util.Map<String, String> validateCandidate(ServerConfigBase config,
+            java.util.Map<String, String> values) {
+        ServerConfigBase scratch = config.scratchCopy();
+        for (var key : KEYS) if (values.containsKey(key.name())) key.apply().apply(scratch, values.get(key.name()));
+        scratch.validate();
+        var effective = new java.util.LinkedHashMap<String, String>();
+        values.keySet().forEach(name -> effective.put(name, batchValue(scratch, name)));
+        return java.util.Map.copyOf(effective);
+    }
+
+    /** Owner-only publication. Correlated generation readers use generationLimits(),
+     * published once at the end of validate; other runtime fields are independently
+     * meaningful. Platform side effects/re-push must run once after this returns. */
+    public static boolean applyBatch(ServerConfigBase config, SettingsPatch.Preview preview) {
+        var current = new java.util.LinkedHashMap<String, String>();
+        preview.relevantInputs().keySet().forEach(name -> current.put(name, batchValue(config, name)));
+        var candidate = SettingsPatch.recheck(preview, config, current, values -> validateCandidate(config, values));
+        for (var key : KEYS) if (preview.changes().containsKey(key.name())) key.apply().apply(config, candidate.get(key.name()));
+        config.validate();
+        return config.trySave();
+    }
+
+    /** Owner-only changed-key undo using the same scratch validation and publication as apply. */
+    public static boolean undoBatch(ServerConfigBase config, SettingsPatch.Preview applied) {
+        var current = new java.util.LinkedHashMap<String, String>();
+        applied.relevantInputs().keySet().forEach(name -> current.put(name, batchValue(config, name)));
+        var candidate = SettingsPatch.undo(applied, config, current, values -> validateCandidate(config, values));
+        for (var key : KEYS) if (applied.changes().containsKey(key.name())) key.apply().apply(config, candidate.get(key.name()));
+        config.validate();
+        return config.trySave();
+    }
+
+    /** Runtime application and per-world repush survive a persistence failure. */
+    public static ApplyResult applyWithPersistenceOutcome(ServerConfigBase config,
+                                                          SettingKey key, String rawValue) {
         boolean isLod = key.name().equals("lodDistanceChunks");
         int beforeScalar = isLod ? config.lodDistanceChunks : 0;
         Map<String, Integer> beforeMap = isLod ? snapshotByWorld(config) : null;
         key.apply().apply(config, rawValue);
         config.validate();
-        config.save();
+        boolean persisted = config.trySave();
         if (isLod) {
             boolean repush = beforeScalar != config.lodDistanceChunks
                     || !beforeMap.equals(snapshotByWorld(config));
-            return new ApplyResult(lodDistanceDisplay(config, rawValue), repush);
+            return new ApplyResult(lodDistanceDisplay(config, rawValue), repush, persisted);
         }
-        return new ApplyResult(key.current().apply(config), false);
+        return new ApplyResult(key.current().apply(config), false, persisted);
     }
 
     /** The reply's value text: lodDistanceChunks bakes its own per-world-aware clamp note

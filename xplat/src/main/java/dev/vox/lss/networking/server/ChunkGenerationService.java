@@ -1,5 +1,7 @@
 package dev.vox.lss.networking.server;
 
+import dev.vox.lss.common.processing.RequestRegistration;
+
 import dev.vox.lss.common.LSSConstants;
 import dev.vox.lss.common.LSSLogger;
 import dev.vox.lss.common.processing.LoadedColumnData;
@@ -29,7 +31,7 @@ public class ChunkGenerationService {
     private static final TicketType LSS_GEN_TICKET =
             new TicketType(TicketType.NO_TIMEOUT, TicketType.FLAG_LOADING);
 
-    record GenerationCallback(UUID playerUuid, long submissionOrder) {}
+    record GenerationCallback(UUID playerUuid, RequestRegistration registration, long submissionOrder) {}
 
     private record PendingGenerationKey(ResourceKey<Level> dimension, int cx, int cz) {}
 
@@ -56,7 +58,7 @@ public class ChunkGenerationService {
 
     private final Object lock = new Object();
     private final LinkedHashMap<PendingGenerationKey, PendingGeneration> active = new LinkedHashMap<>();
-    private final Map<UUID, Integer> perPlayerActiveCount = new HashMap<>();
+    private final Map<RequestRegistration, Integer> perPlayerActiveCount = new HashMap<>();
     // Departing-player ticket releases, staggered a few per tick — a one-call bulk sweep
     // of corridor-scattered tickets froze a C2ME server for 60 s inside the consolidated
     // distance-graph fixpoint (see DeferredTicketReleases).
@@ -84,8 +86,9 @@ public class ChunkGenerationService {
     /** Test seam constructor (see {@link ColumnSerializer}); zero behavior change when
      *  default-wired through the production constructor above. */
     public ChunkGenerationService(LSSServerConfig config, ColumnSerializer columnSerializer) {
-        this.maxConcurrent = config.generationConcurrencyLimitGlobal;
-        this.maxPerPlayerActive = config.generationConcurrencyLimitPerPlayer;
+        var generationLimits = config.generationLimits();
+        this.maxConcurrent = generationLimits.global();
+        this.maxPerPlayerActive = generationLimits.perPlayer();
         this.timeoutTicks = config.generationTimeoutSeconds * LSSConstants.TICKS_PER_SECOND;
         this.columnSerializer = columnSerializer;
     }
@@ -111,20 +114,21 @@ public class ChunkGenerationService {
      * Submit a generation request. Returns true if accepted (piggyback or new active slot),
      * false if at capacity (caller should feed back a rejection result).
      */
-    public boolean submitGeneration(UUID playerUuid, ServerLevel level, int cx, int cz, long submissionOrder) {
+    public boolean submitGeneration(UUID playerUuid, RequestRegistration registration, ServerLevel level, int cx, int cz, long submissionOrder) {
+        if (registration.isRetired()) return false;
         var key = new PendingGenerationKey(level.dimension(), cx, cz);
 
         synchronized (this.lock) {
             // Already active — piggyback on existing entry
             var existing = this.active.get(key);
             if (existing != null) {
-                existing.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
-                incrementCount(this.perPlayerActiveCount, playerUuid);
+                existing.callbacks.add(new GenerationCallback(playerUuid, registration, submissionOrder));
+                incrementCount(this.perPlayerActiveCount, registration);
                 return true;
             }
 
             // Try to add directly to active
-            int playerActive = this.perPlayerActiveCount.getOrDefault(playerUuid, 0);
+            int playerActive = this.perPlayerActiveCount.getOrDefault(registration, 0);
             if (this.active.size() < this.maxConcurrent && playerActive < this.maxPerPlayerActive) {
                 var pos = new ChunkPos(cx, cz);
                 // A pending deferred release for this key means the ticket is STILL HELD —
@@ -135,9 +139,9 @@ public class ChunkGenerationService {
                 }
 
                 var gen = new PendingGeneration(pos, level);
-                gen.callbacks.add(new GenerationCallback(playerUuid, submissionOrder));
+                gen.callbacks.add(new GenerationCallback(playerUuid, registration, submissionOrder));
                 this.active.put(key, gen);
-                incrementCount(this.perPlayerActiveCount, playerUuid);
+                incrementCount(this.perPlayerActiveCount, registration);
                 this.totalSubmitted++;
                 return true;
             }
@@ -208,9 +212,9 @@ public class ChunkGenerationService {
                         // One GenerationReadyData per callback — processing thread will voxelize
                         for (var cb : gen.callbacks) {
                             ready.add(new TickSnapshot.GenerationReadyData(
-                                    cb.playerUuid, gen.pos.x(), gen.pos.z(), dimension,
+                                    cb.playerUuid, cb.registration, gen.pos.x(), gen.pos.z(), dimension,
                                     columnData, columnTimestamp, cb.submissionOrder));
-                            decrementCount(this.perPlayerActiveCount, cb.playerUuid);
+                            decrementCount(this.perPlayerActiveCount, cb.registration);
                         }
                         this.totalCompleted++;
                     } catch (Throwable t) {
@@ -248,15 +252,15 @@ public class ChunkGenerationService {
         String dimension = gen.level.dimension().identifier().toString();
         for (var cb : gen.callbacks) {
             ready.add(new TickSnapshot.GenerationReadyData(
-                    cb.playerUuid, gen.pos.x(), gen.pos.z(), dimension,
+                    cb.playerUuid, cb.registration, gen.pos.x(), gen.pos.z(), dimension,
                     null, 0L, cb.submissionOrder, transientFailure));
-            decrementCount(this.perPlayerActiveCount, cb.playerUuid);
+            decrementCount(this.perPlayerActiveCount, cb.registration);
         }
     }
 
-    public void removePlayer(UUID playerUuid) {
+    public void removePlayer(UUID playerUuid, RequestRegistration registration) {
         synchronized (this.lock) {
-            this.perPlayerActiveCount.remove(playerUuid);
+            this.perPlayerActiveCount.remove(registration);
 
             // Clean up active entries. Ticket releases are DEFERRED, not executed here: this
             // sweep can hold the per-player cap's worth of corridor-scattered tickets, and
@@ -264,7 +268,7 @@ public class ChunkGenerationService {
             List<PendingGenerationKey> toRemove = new ArrayList<>();
             for (var entry : this.active.entrySet()) {
                 var gen = entry.getValue();
-                gen.callbacks.removeIf(cb -> cb.playerUuid.equals(playerUuid));
+                gen.callbacks.removeIf(cb -> cb.playerUuid.equals(playerUuid) && cb.registration == registration);
                 if (gen.callbacks.isEmpty()) {
                     var level = gen.level;
                     var pos = gen.pos;
@@ -311,11 +315,11 @@ public class ChunkGenerationService {
         }
     }
 
-    private static void incrementCount(Map<UUID, Integer> map, UUID uuid) {
+    private static void incrementCount(Map<RequestRegistration, Integer> map, RequestRegistration uuid) {
         map.merge(uuid, 1, Integer::sum);
     }
 
-    private static void decrementCount(Map<UUID, Integer> map, UUID uuid) {
+    private static void decrementCount(Map<RequestRegistration, Integer> map, RequestRegistration uuid) {
         var count = map.get(uuid);
         if (count != null) {
             if (count <= 1) map.remove(uuid);

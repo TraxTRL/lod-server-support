@@ -264,6 +264,76 @@ public class CommandGameTests {
         helper.succeed();
     }
 
+    /** Per-world set/clear through Brigadier must reach negotiation and the range gate. */
+    @GameTest(structure = "fabric-gametest-api-v1:empty")
+    public void setWorldLodDistanceUpdatesHandshakeAndRangeWithoutChangingDefault(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        var server = level.getServer();
+        var commands = server.getCommands();
+        var service = LSSServerNetworking.getRequestService();
+        helper.assertTrue(service != null, "service active on the gametest server");
+        var player = placeMockServerPlayer(helper);
+        var config = LSSServerConfig.CONFIG;
+        int savedDistance = config.lodDistanceChunks;
+        var savedOverrides = config.lodDistanceChunksByWorld;
+        var lines = new ArrayList<String>();
+        var source = new CommandSourceStack(recorder(lines), Vec3.ZERO, Vec2.ZERO, level,
+                PermissionSet.ALL_PERMISSIONS, "lss-test", Component.literal("lss-test"), server, null);
+        String world = level.dimension().identifier().toString();
+        var replies = new ArrayList<dev.vox.lss.networking.payloads.SessionConfigS2CPayload>();
+        var handshake = new dev.vox.lss.networking.payloads.HandshakeC2SPayload(
+                LSSConstants.PROTOCOL_VERSION, LSSConstants.CAPABILITY_VOXEL_COLUMNS);
+        try {
+            config.lodDistanceChunks = 96;
+            config.lodDistanceChunksByWorld = new java.util.LinkedHashMap<>();
+            LSSServerNetworking.handleHandshake(handshake, player, service, replies::add);
+            helper.assertTrue(replies.size() == 1 && replies.get(0).lodDistanceChunks() == 96,
+                    "control: the first handshake uses the default");
+
+            commands.performPrefixedCommand(source, "lsslod set lodDistanceChunks " + world + " 7");
+            helper.assertTrue(config.lodDistanceChunks == 96 && config.lodDistanceForWorld(world) == 7,
+                    "a world override must preserve the global default");
+            helper.assertTrue(anyLineContains(lines, "re-pushed to ")
+                            && !anyLineContains(lines, "re-pushed to 0 "),
+                    "an override-only mutation must push to the negotiated client: " + lines);
+            replies.clear();
+            LSSServerNetworking.handleHandshake(handshake, player, service, replies::add);
+            helper.assertTrue(replies.size() == 1 && replies.get(0).lodDistanceChunks() == 7,
+                    "the current world's override must be advertised on the wire");
+
+            var state = service.getPlayers().get(player.getUUID());
+            long before = state.getTotalRequestsReceived();
+            int cx = player.getBlockX() >> 4;
+            int cz = player.getBlockZ() >> 4;
+            int radius = 7 + LSSConstants.LOD_DISTANCE_BUFFER;
+            service.handleBatchRequest(player, new dev.vox.lss.networking.payloads.BatchChunkRequestC2SPayload(
+                    new long[]{PositionUtil.packPosition(cx + radius, cz),
+                            PositionUtil.packPosition(cx + radius + 1, cz)}, new long[]{0L, 0L}, 2));
+            helper.assertTrue(state.getTotalRequestsReceived() == before + 1,
+                    "only the override boundary is accepted; the global radius must not leak through");
+
+            lines.clear();
+            commands.performPrefixedCommand(source, "lsslod set lodDistanceChunks " + world + " default");
+            helper.assertTrue(!config.lodDistanceChunksByWorld.containsKey(world), "clear removes the override");
+            helper.assertTrue(anyLineContains(lines, "re-pushed to ")
+                            && !anyLineContains(lines, "re-pushed to 0 "),
+                    "clearing an override must also push the restored distance: " + lines);
+            replies.clear();
+            LSSServerNetworking.handleHandshake(handshake, player, service, replies::add);
+            helper.assertTrue(replies.size() == 1 && replies.get(0).lodDistanceChunks() == 96,
+                    "clearing restores the advertised default");
+        } finally {
+            service.removePlayer(player.getUUID());
+            service.getDialectTracker().onDisconnect(player.getUUID());
+            server.getPlayerList().remove(player);
+            config.lodDistanceChunks = savedDistance;
+            config.lodDistanceChunksByWorld = savedOverrides;
+            config.validate();
+            config.save();
+        }
+        helper.succeed();
+    }
+
     /**
      * CG-022: /lsslod stats executed through the dispatcher against the LIVE service with a
      * registered player carrying known counters — the command → service → shared formatter
@@ -480,5 +550,97 @@ public class CommandGameTests {
             service.shutdown();
             playerList.remove(mock);
         });
+    }
+
+    /** The actual per-line scenario files, executed and read back through Minecraft's
+     * registered command tree. Restore within this callback, before any other test ticks. */
+    @GameTest(structure = "fabric-gametest-api-v1:empty")
+    public void soakScenarioGamerulesExecuteAndReadBack(GameTestHelper helper) throws Exception {
+        var root = java.nio.file.Path.of("").toAbsolutePath();
+        while (root != null && !java.nio.file.Files.isDirectory(root.resolve("scripts/soak-scenarios"))) {
+            root = root.getParent();
+        }
+        helper.assertTrue(root != null, "could not locate actual scenario JSON files");
+        var commandsToCheck = new java.util.TreeSet<String>();
+        try (var paths = java.nio.file.Files.list(root.resolve("scripts/soak-scenarios"))) {
+            for (var path : paths.filter(p -> p.toString().endsWith(".json")).toList()) {
+                var json = com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(path)).getAsJsonObject();
+                if (!json.has("steps")) continue;
+                for (var step : json.getAsJsonArray("steps")) {
+                    String command = step.getAsJsonObject().get("cmd").getAsString();
+                    if (command.startsWith("gamerule ")) commandsToCheck.add(command);
+                }
+            }
+        }
+        helper.assertTrue(commandsToCheck.size() >= 5, "scenario setup command inventory must not be empty");
+        var server = helper.getLevel().getServer();
+        var commands = server.getCommands();
+        var source = server.createCommandSourceStack();
+        for (String command : commandsToCheck) {
+            int split = command.lastIndexOf(' ');
+            String query = command.substring(0, split);
+            String value = command.substring(split + 1);
+            var before = dev.vox.lss.benchmark.SoakCommandExecutor.executeForResult(commands, source, query);
+            helper.assertTrue(before.success(), "real rule query must succeed: " + query);
+            try {
+                helper.assertTrue(dev.vox.lss.benchmark.SoakCommandExecutor.setGamerule(commands, source, command),
+                        "scenario setter and exact readback must succeed (zero is valid): " + command);
+            } finally {
+                String restore = value.equals("true") || value.equals("false")
+                        ? Boolean.toString(before.value() != 0) : Integer.toString(before.value());
+                helper.assertTrue(dev.vox.lss.benchmark.SoakCommandExecutor.setGamerule(commands, source, query + " " + restore),
+                        "must restore original gamerule: " + query);
+            }
+        }
+        helper.succeed();
+    }
+
+    @GameTest(structure = "fabric-gametest-api-v1:empty")
+    public void soakCommandsRejectInvalidSyntaxAndMissingCallbacks(GameTestHelper helper) {
+        var server = helper.getLevel().getServer();
+        var commands = server.getCommands();
+        var source = server.createCommandSourceStack();
+        for (String bad : java.util.List.of("gamerule lss_nonexistent_rule 0", "gamerule", "execute in")) {
+            boolean rejected = false;
+            try {
+                dev.vox.lss.benchmark.SoakCommandExecutor.dispatch(commands, source, bad);
+            } catch (IllegalArgumentException expected) {
+                rejected = true;
+            }
+            helper.assertTrue(rejected, "unknown/incomplete command must fail validation: " + bad);
+        }
+        // Real command context deliberately defers the inner queue. Our tick-only helper
+        // must not report semantic success before the callback actually runs.
+        dev.vox.lss.benchmark.SoakCommandExecutor.Result[] nested = {null};
+        net.minecraft.commands.Commands.executeCommandInContext(source, context -> {
+            nested[0] = dev.vox.lss.benchmark.SoakCommandExecutor.executeForResult(commands, source, "list");
+        });
+        helper.assertTrue(nested[0] != null && !nested[0].success(),
+                "missing/deferred callback must not become success");
+        helper.succeed();
+    }
+
+    @GameTest(structure = "fabric-gametest-api-v1:empty")
+    public void soakCommandsDistinguishHandlerFailureAndWrongReadback(GameTestHelper helper) {
+        var server = helper.getLevel().getServer();
+        var commands = server.getCommands();
+        var source = server.createCommandSourceStack();
+        commands.getDispatcher().register(net.minecraft.commands.Commands.literal("lss_soak_test_failure")
+                .executes(context -> { throw new com.mojang.brigadier.exceptions.SimpleCommandExceptionType(
+                        Component.literal("deliberate soak handler failure")).create(); }));
+        helper.assertTrue(!dev.vox.lss.benchmark.SoakCommandExecutor.executeForResult(
+                        commands, source, "lss_soak_test_failure").success(),
+                "command failure callback must remain false");
+        helper.assertTrue(dev.vox.lss.benchmark.SoakCommandExecutor.dispatch(
+                        commands, source, "lss_soak_test_failure"),
+                "generic cleanup retains parse/dispatch semantics, not mandatory effects");
+        commands.getDispatcher().register(net.minecraft.commands.Commands.literal("lss_soak_test_readback")
+                .executes(context -> 1)
+                .then(net.minecraft.commands.Commands.argument("value", com.mojang.brigadier.arguments.IntegerArgumentType.integer())
+                        .executes(context -> com.mojang.brigadier.arguments.IntegerArgumentType.getInteger(context, "value"))));
+        helper.assertTrue(!dev.vox.lss.benchmark.SoakCommandExecutor.setGamerule(
+                        commands, source, "lss_soak_test_readback 0"),
+                "successful zero-valued setter cannot hide wrong readback");
+        helper.succeed();
     }
 }
